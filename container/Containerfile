@@ -1,0 +1,57 @@
+# Eryx development container - persistent build environment
+# Build: container build -t eryx-dev container/
+# Run:   container run -it --name eryx-dev -v /Users/daniel/extgit/eryx:/workspace -c 8 -m 8G eryx-dev
+
+FROM docker.io/library/ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies (mirrors CI: clang, mold, protoc, zstd, etc.)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    clang \
+    curl \
+    git \
+    libssl-dev \
+    mold \
+    pkg-config \
+    protobuf-compiler \
+    zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust (stable + nightly for build-std)
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
+    -y --default-toolchain 1.92.0 --profile default && \
+    rustup toolchain install nightly --component rust-src && \
+    rustup target add wasm32-wasip1 --toolchain nightly
+
+# Install cargo tools
+RUN cargo install cargo-nextest --version 0.9.114 --locked && \
+    cargo install wasm-tools --version 1.243.0 --locked
+
+# Install WASI SDK 27
+ENV WASI_SDK_PATH=/opt/wasi-sdk
+RUN curl -fSL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-27/wasi-sdk-27.0-arm64-linux.tar.gz \
+    | tar xz --strip-components=1 -C /tmp && \
+    mkdir -p $WASI_SDK_PATH && \
+    mv /tmp/* $WASI_SDK_PATH/ || true
+
+# Symlink rustup/cargo to default locations so they work even when
+# RUSTUP_HOME/CARGO_HOME env vars are stripped (eryx-runtime build.rs does this)
+RUN rm -rf /root/.rustup && ln -s /usr/local/rustup /root/.rustup
+
+# Configure mold linker for faster linking
+RUN mkdir -p /root/.cargo && \
+    printf '[target.aarch64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=mold"]\n' \
+    > /root/.cargo/config.toml
+
+# Cargo build cache lives in the container (persistent across runs)
+# Source code is bind-mounted at /workspace
+WORKDIR /workspace
+
+# Use a shell entrypoint so the container stays alive
+CMD ["/bin/bash"]
