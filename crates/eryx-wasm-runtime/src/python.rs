@@ -958,6 +958,8 @@ exec(compile(r'''
 """Eryx async runtime - minimal asyncio event loop for Component Model async."""
 
 import asyncio
+import contextvars
+import time
 import _eryx
 from contextvars import ContextVar, Context
 from dataclasses import dataclass
@@ -1009,7 +1011,7 @@ class _EryxLoop(asyncio.AbstractEventLoop):
     # Required methods for asyncio.Task to work
     def call_soon(self, callback, *args, context=None):
         if context is None:
-            raise AssertionError("context required for call_soon")
+            context = contextvars.copy_context()
         handle = asyncio.Handle(callback, args, self, context)
         context[_async_state].handles.append(handle)
         return handle
@@ -1032,8 +1034,11 @@ class _EryxLoop(asyncio.AbstractEventLoop):
     def call_exception_handler(self, context):
         self.exception = context.get('exception')
 
+    def get_task_factory(self):
+        return None
+
     # Stub methods required by AbstractEventLoop
-    def time(self): raise NotImplementedError
+    def time(self): return time.monotonic()
     def run_forever(self): raise NotImplementedError
     def run_until_complete(self, future): raise NotImplementedError
     def stop(self): self.running = False
@@ -1935,6 +1940,20 @@ TCP_NODELAY = 1
 SHUT_RD = 0
 SHUT_WR = 1
 SHUT_RDWR = 2
+AF_UNSPEC = 0
+
+# IntEnum types for compatibility with libraries like anyio
+from enum import IntEnum as _IntEnum
+
+class AddressFamily(_IntEnum):
+    AF_UNSPEC = 0
+    AF_UNIX = 1
+    AF_INET = 2
+    AF_INET6 = 10
+
+class SocketKind(_IntEnum):
+    SOCK_STREAM = 1
+    SOCK_DGRAM = 2
 
 # Feature flags
 has_ipv6 = False
