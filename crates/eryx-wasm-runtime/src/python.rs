@@ -655,6 +655,14 @@ fn subtask_drop_(task: u32) {
     unsafe { crate::subtask_drop(task) }
 }
 
+/// Request cancellation of an in-flight subtask and return its resolved
+/// status code. The sync intrinsic blocks until the subtask is resolved,
+/// so after this returns it is safe to call `subtask_drop_`.
+#[pyfunction]
+fn subtask_cancel_(task: u32) -> u32 {
+    unsafe { crate::subtask_cancel(task) }
+}
+
 /// Get result from a completed async promise.
 ///
 /// This retrieves the result JSON stored in `__main__._eryx_async_import_results[subtask]`
@@ -913,6 +921,7 @@ fn eryx_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(context_set_, m)?)?;
     m.add_function(wrap_pyfunction!(context_get_, m)?)?;
     m.add_function(wrap_pyfunction!(subtask_drop_, m)?)?;
+    m.add_function(wrap_pyfunction!(subtask_cancel_, m)?)?;
     m.add_function(wrap_pyfunction!(promise_get_result_, m)?)?;
     // TCP networking functions
     m.add_function(wrap_pyfunction!(_eryx_tcp_connect, m)?)?;
@@ -1111,6 +1120,39 @@ def _poll(state: _AsyncState) -> int:
         return WAIT | (state.waitable_set << 4)
 
 
+async def _await_waitable(waitable: int) -> None:
+    """Join `waitable` to the current state's set and await completion.
+
+    On cancellation or any other exception before completion, release the
+    host subtask so the host can tear it down and the waitable set can
+    eventually be dropped cleanly.
+
+    The Component Model canonical ABI forbids dropping a subtask that has
+    not yet resolved: `subtask.drop` on an in-flight subtask traps. We
+    therefore call `subtask.cancel` first — the sync intrinsic blocks
+    until the subtask resolves (returned, started-cancelled, or
+    returned-cancelled) and returns the final status code. After that,
+    `subtask.drop` is safe. If the subtask had already completed before
+    cancellation arrived, `await future` returns normally and we skip this
+    path entirely.
+    """
+    future = _loop.create_future()
+    state = _async_state.get()
+    state.futures[waitable] = future
+    if state.waitable_set is None:
+        state.waitable_set = _eryx.waitable_set_new_()
+    _eryx.waitable_join_(waitable, state.waitable_set)
+    try:
+        await future
+    except BaseException:
+        state.futures.pop(waitable, None)
+        # Resolve the subtask (sync cancel) before dropping; CM traps on
+        # drop-of-unresolved.
+        _eryx.subtask_cancel_(waitable)
+        _eryx.subtask_drop_(waitable)
+        raise
+
+
 async def await_invoke(name: str, args_json: str) -> str:
     """Invoke a callback and await its result. Returns result JSON."""
     import json
@@ -1122,16 +1164,8 @@ async def await_invoke(name: str, args_json: str) -> str:
     elif result_type == 1:  # Err - immediate error
         raise RuntimeError(value)
     else:  # Pending - need to wait
-        waitable, promise = value
-        future = _loop.create_future()
-        state = _async_state.get()
-        state.futures[waitable] = future
-
-        if state.waitable_set is None:
-            state.waitable_set = _eryx.waitable_set_new_()
-        _eryx.waitable_join_(waitable, state.waitable_set)
-
-        await future
+        waitable, _promise = value
+        await _await_waitable(waitable)
 
         # Get the result wrapper and parse it.
         # Use waitable (the subtask ID) as the key, not promise (which is always 0).
@@ -1161,15 +1195,7 @@ async def _await_net_result(result_type: int, value: Any) -> Any:
         raise OSError(value)
     else:  # Pending - need to wait
         waitable, _promise = value
-        future = _loop.create_future()
-        state = _async_state.get()
-        state.futures[waitable] = future
-
-        if state.waitable_set is None:
-            state.waitable_set = _eryx.waitable_set_new_()
-        _eryx.waitable_join_(waitable, state.waitable_set)
-
-        await future
+        await _await_waitable(waitable)
 
         # Get result from _eryx_net_results dict (set by Rust during resume)
         net_results = getattr(__main__, '_eryx_net_results', {})

@@ -64,6 +64,14 @@ unsafe extern "C" {
     /// Drop a completed subtask to release resources.
     #[link_name = "[subtask-drop]"]
     pub fn subtask_drop(task: u32);
+
+    /// Request cancellation of an in-flight subtask. Returns the final
+    /// subtask status once it has resolved (2=RETURNED, 3=STARTED_CANCELLED,
+    /// 4=RETURNED_CANCELLED). The sync flavour of this intrinsic is
+    /// guaranteed to complete synchronously. After this returns, the subtask
+    /// is resolved and can be passed to `subtask_drop`.
+    #[link_name = "[subtask-cancel]"]
+    pub fn subtask_cancel(task: u32) -> u32;
 }
 
 /// Our call context - holds a stack for passing values between wit-dylib and our code.

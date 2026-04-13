@@ -37,8 +37,9 @@ def _poll(state: _AsyncState) -> int:
             for t in stragglers:
                 t.cancel()
             # Run the cancellation handlers. Stragglers awaiting host waitables
-            # will take the _await_waitable exception path (Step 1) and call
-            # subtask_drop_ on their host subtasks.
+            # will take the _await_waitable exception path (Step 1), which
+            # does sync `subtask_cancel_` → `subtask_drop_` to release their
+            # host subtasks.
             _loop.poll(state)
             # If anything is still awaiting a host event (e.g. shielded tasks),
             # return WAIT so wasmtime keeps resuming us until the set is empty.
@@ -63,9 +64,11 @@ Key points:
   round, we return WAIT and let wasmtime keep calling `resume`. Subsequent
   `_poll` calls will re-enter this branch (pending_count is still 0) and keep
   draining until `state.futures` is empty.
-- **Depends on Step 1.** Without the `_await_waitable` fix, cancelling a
-  straggler doesn't actually release its host subtask, so draining would never
-  complete. This is why Step 1 ships first.
+- **Depends on Step 1.** Without the `_await_waitable` fix (which does
+  `subtask.cancel` → `subtask.drop` on the cancellation path), cancelling a
+  straggler doesn't release its host subtask, so draining would never
+  complete — and `waitable_set.drop` would trap at shutdown. This is why
+  Step 1 ships first.
 - **Preserves existing exception behaviour.** `_loop.exception` is still raised
   out of `poll()`, so genuine errors in stragglers aren't silently swallowed.
 
