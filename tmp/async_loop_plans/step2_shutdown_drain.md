@@ -25,14 +25,40 @@ Treat main coroutine completion as the **start** of shutdown, not the end.
 Match `asyncio.runners.Runner.close()` semantics: cancel all live tasks, drain
 them, then tear down the set.
 
-Rewrite the exit branch of `_poll` (python.rs:1101-1111) roughly as:
+### Track tasks in `_AsyncState`
+
+Add a `tasks: set` field to `_AsyncState` and register every task in
+`_EryxLoop.create_task()`. This gives us a reliable, self-contained set of
+live tasks without depending on `asyncio.all_tasks()` (see "Alternatives
+considered" below).
+
+```python
+@dataclass
+class _AsyncState:
+    waitable_set: Optional[int]
+    futures: dict[int, asyncio.Future]
+    handles: list[asyncio.Handle]
+    pending_count: int
+    tasks: set  # NEW — all tasks created under this state
+```
+
+```python
+def create_task(self, coro, *, name=None, context=None):
+    task = asyncio.Task(coro, loop=self, context=context)
+    _async_state.get().tasks.add(task)
+    return task
+```
+
+### Rewrite `_poll` drain logic
+
+Rewrite the exit branch of `_poll` (python.rs ~line 1110) roughly as:
 
 ```python
 def _poll(state: _AsyncState) -> int:
     _loop.poll(state)
     if state.pending_count == 0:
         # Main coroutine done — cancel any stragglers and drain them.
-        stragglers = [t for t in asyncio.all_tasks(_loop) if not t.done()]
+        stragglers = [t for t in state.tasks if not t.done()]
         if stragglers:
             for t in stragglers:
                 t.cancel()
@@ -59,6 +85,10 @@ def _poll(state: _AsyncState) -> int:
 
 Key points:
 
+- **Tasks tracked explicitly in `_AsyncState`.** All task creation flows
+  through `_EryxLoop.create_task()`, so `state.tasks` captures everything —
+  both the internal `_return_result` wrapper and user `asyncio.create_task()`
+  calls. This is self-contained and doesn't rely on asyncio internals.
 - **Drain uses the existing WAIT/resume machinery.** We don't invent a new
   codepath; if stragglers are still awaiting host events after the first cancel
   round, we return WAIT and let wasmtime keep calling `resume`. Subsequent
@@ -72,10 +102,23 @@ Key points:
 - **Preserves existing exception behaviour.** `_loop.exception` is still raised
   out of `poll()`, so genuine errors in stragglers aren't silently swallowed.
 
+### Alternatives considered
+
+- **`asyncio.all_tasks(_loop)`** — the original approach. asyncio maintains a
+  global weak set of tasks internally, so `all_tasks()` would return them.
+  However, this depends on CPython implementation details of how
+  `asyncio.Task.__init__` registers into that weak set, and our custom
+  `_EryxLoop` may not fully participate in all the bookkeeping asyncio expects.
+  Tracking tasks ourselves in `_AsyncState` is more robust and keeps the async
+  state self-contained in one place.
+
 ## Files to touch
 
-- `crates/eryx-wasm-runtime/src/python.rs` — the `_poll` function inside
-  `ERYX_ASYNC_INJECT_CODE`, around line 1101.
+- `crates/eryx-wasm-runtime/src/python.rs` — all within `ERYX_ASYNC_INJECT_CODE`:
+  - `_AsyncState` dataclass: add `tasks: set` field
+  - `_EryxLoop.create_task()`: register task into `_async_state.get().tasks`
+  - `run_async()`: initialize `tasks=set()` in `_AsyncState` constructor
+  - `_poll()`: replace immediate-exit with drain logic
 
 No Rust-side, WIT, or host-side changes.
 

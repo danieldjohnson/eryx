@@ -1,10 +1,16 @@
-//! Integration tests for the `_await_waitable` cleanup helper.
+//! Integration tests for async cleanup: `_await_waitable` (Step 1) and
+//! shutdown drain (Step 2).
 //!
-//! These tests exercise the path where an asyncio Task is cancelled while
+//! **Step 1 tests** exercise the path where an asyncio Task is cancelled while
 //! suspended inside a host-waitable wrapper (callback invoke, TCP, TLS). The
 //! helper must pop the future from `_AsyncState.futures` and drop the host
 //! subtask; otherwise the subtask leaks and `waitable_set.drop` traps at
 //! shutdown when the set is still non-empty.
+//!
+//! **Step 2 tests** exercise the shutdown drain: when the main coroutine
+//! returns while background tasks are still live, `_poll` must cancel the
+//! stragglers via the existing WAIT/resume machinery instead of immediately
+//! dropping the waitable set (which would trap on a non-empty set).
 //!
 //! The tests are intentionally in-Python: we can't drive cancellation via
 //! `asyncio.wait_for` (that requires `call_later`, which is Step 3), so we
@@ -264,6 +270,173 @@ print(f"SLEPT:{result['slept_ms']}")
     assert!(
         output.stdout.contains("SLEPT:10"),
         "Non-cancelled callback should return its result: {}",
+        output.stdout
+    );
+}
+
+// =============================================================================
+// Step 2 — Shutdown drain tests
+// =============================================================================
+
+/// Fire-and-forget: main returns immediately while a slow background task is
+/// still awaiting a host callback. The drain logic in `_poll` must cancel the
+/// straggler (triggering the Step 1 `_await_waitable` cleanup path) and drop
+/// the waitable set cleanly. Before Step 2, this would trap on
+/// `waitable_set.drop` because the set still contained the live subtask.
+#[tokio::test]
+async fn test_fire_and_forget_straggler_drained_on_shutdown() {
+    let sandbox = sandbox_builder()
+        .with_callback(SleepCallback)
+        .build()
+        .expect("Failed to build sandbox");
+
+    let result = sandbox
+        .execute(
+            r#"
+import asyncio
+
+# Fire-and-forget: start a slow callback but don't await it.
+asyncio.create_task(sleep_cb(ms=5000))
+
+# Yield a few times so the task reaches _await_waitable (suspended on host).
+for _ in range(3):
+    await asyncio.sleep(0)
+
+# Main returns. The straggler is still pending.
+print("MAIN_DONE")
+"#,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "Shutdown should drain the straggler cleanly, not trap: {:?}",
+        result
+    );
+    let output = result.unwrap();
+    assert!(
+        output.stdout.contains("MAIN_DONE"),
+        "Main coroutine should have completed: {}",
+        output.stdout
+    );
+}
+
+/// Multiple fire-and-forget tasks pending at shutdown. All must be cancelled
+/// and their host subtasks released before the waitable set is dropped.
+#[tokio::test]
+async fn test_multiple_stragglers_drained_on_shutdown() {
+    let sandbox = sandbox_builder()
+        .with_callback(SleepCallback)
+        .build()
+        .expect("Failed to build sandbox");
+
+    let result = sandbox
+        .execute(
+            r#"
+import asyncio
+
+# Spawn several background tasks, all awaiting slow host callbacks.
+for i in range(5):
+    asyncio.create_task(sleep_cb(ms=5000))
+
+for _ in range(3):
+    await asyncio.sleep(0)
+
+print("MAIN_DONE")
+"#,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "Shutdown should drain multiple stragglers cleanly: {:?}",
+        result
+    );
+    let output = result.unwrap();
+    assert!(
+        output.stdout.contains("MAIN_DONE"),
+        "Main coroutine should have completed: {}",
+        output.stdout
+    );
+}
+
+/// A mix of completed and still-pending background tasks at shutdown. The
+/// drain should handle both: skip done tasks, cancel pending ones, and drop
+/// the waitable set cleanly.
+#[tokio::test]
+async fn test_mixed_completed_and_pending_stragglers() {
+    let sandbox = sandbox_builder()
+        .with_callback(SleepCallback)
+        .with_callback(EchoCallback)
+        .build()
+        .expect("Failed to build sandbox");
+
+    let result = sandbox
+        .execute(
+            r#"
+import asyncio
+
+# Start a fast background task and await it so it completes.
+bg_result = await echo(message="bg")
+print(f"BG_RESULT:{bg_result['echoed']}")
+
+# Now start a straggler that will still be pending at shutdown.
+asyncio.create_task(sleep_cb(ms=5000))
+for _ in range(3):
+    await asyncio.sleep(0)
+
+print("MAIN_DONE")
+"#,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "Mix of completed and pending tasks should drain cleanly: {:?}",
+        result
+    );
+    let output = result.unwrap();
+    assert!(
+        output.stdout.contains("BG_RESULT:bg"),
+        "Completed background task should have returned its result: {}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("MAIN_DONE"),
+        "Main coroutine should have completed: {}",
+        output.stdout
+    );
+}
+
+/// No stragglers at all — the happy path. `state.tasks` contains only the
+/// main `_return_result` wrapper, which is done. Drain finds nothing to cancel
+/// and drops the waitable set immediately. This is a regression guard to ensure
+/// the drain logic doesn't break the common case.
+#[tokio::test]
+async fn test_no_stragglers_clean_shutdown() {
+    let sandbox = sandbox_builder()
+        .with_callback(EchoCallback)
+        .build()
+        .expect("Failed to build sandbox");
+
+    let result = sandbox
+        .execute(
+            r#"
+result = await echo(message="hello")
+print(f"RESULT:{result['echoed']}")
+"#,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "No-straggler shutdown must still work: {:?}",
+        result
+    );
+    let output = result.unwrap();
+    assert!(
+        output.stdout.contains("RESULT:hello"),
+        "Callback result should be returned: {}",
         output.stdout
     );
 }

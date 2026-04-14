@@ -992,6 +992,7 @@ class _AsyncState:
     futures: dict[int, asyncio.Future]
     handles: list[asyncio.Handle]
     pending_count: int
+    tasks: set
 
 
 class _EryxLoop(asyncio.AbstractEventLoop):
@@ -1026,7 +1027,11 @@ class _EryxLoop(asyncio.AbstractEventLoop):
         return handle
 
     def create_task(self, coro, *, name=None, context=None):
-        return asyncio.Task(coro, loop=self, context=context)
+        if context is None:
+            context = contextvars.copy_context()
+        task = asyncio.Task(coro, loop=self, context=context)
+        context[_async_state].tasks.add(task)
+        return task
 
     def create_future(self):
         return asyncio.Future(loop=self)
@@ -1084,7 +1089,7 @@ async def _return_result(coroutine: Any) -> None:
 def run_async(coro) -> int:
     """Run a coroutine, return callback code (EXIT or WAIT|waitable_set<<4)."""
     ctx = Context()
-    state = _AsyncState(None, {}, [], 1)
+    state = _AsyncState(None, {}, [], 1, set())
     ctx.run(_set_async_state, state)
     asyncio.create_task(_return_result(coro), context=ctx)
     return _poll(state)
@@ -1111,6 +1116,23 @@ def _poll(state: _AsyncState) -> int:
     """Poll the event loop and return callback code."""
     _loop.poll(state)
     if state.pending_count == 0:
+        # Main coroutine done — cancel any stragglers and drain them.
+        stragglers = [t for t in state.tasks if not t.done()]
+        if stragglers:
+            for t in stragglers:
+                t.cancel()
+            # Run cancellation handlers. Stragglers awaiting host waitables
+            # will take the _await_waitable exception path (Step 1), which
+            # does sync subtask_cancel_ -> subtask_drop_ to release their
+            # host subtasks.
+            _loop.poll(state)
+            # If anything is still awaiting a host event (e.g. shielded tasks),
+            # return WAIT so wasmtime keeps resuming us until the set is empty.
+            if state.futures:
+                assert state.waitable_set is not None
+                _eryx.context_set_(state)
+                return WAIT | (state.waitable_set << 4)
+
         if state.waitable_set is not None:
             _eryx.waitable_set_drop_(state.waitable_set)
         return EXIT
