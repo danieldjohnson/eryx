@@ -1,21 +1,19 @@
-//! Integration tests for async cleanup: `_await_waitable` (Step 1) and
-//! shutdown drain (Step 2).
+//! Integration tests for async cleanup: `_await_waitable` cancellation and
+//! shutdown drain.
 //!
-//! **Step 1 tests** exercise the path where an asyncio Task is cancelled while
-//! suspended inside a host-waitable wrapper (callback invoke, TCP, TLS). The
-//! helper must pop the future from `_AsyncState.futures` and drop the host
+//! **Cancellation tests** exercise the path where an asyncio Task is cancelled
+//! while suspended inside a host-waitable wrapper (callback invoke, TCP, TLS).
+//! The helper must pop the future from `_AsyncState.futures` and drop the host
 //! subtask; otherwise the subtask leaks and `waitable_set.drop` traps at
 //! shutdown when the set is still non-empty.
 //!
-//! **Step 2 tests** exercise the shutdown drain: when the main coroutine
+//! **Shutdown drain tests** exercise the drain logic: when the main coroutine
 //! returns while background tasks are still live, `_poll` must cancel the
 //! stragglers via the existing WAIT/resume machinery instead of immediately
 //! dropping the waitable set (which would trap on a non-empty set).
 //!
-//! The tests are intentionally in-Python: we can't drive cancellation via
-//! `asyncio.wait_for` (that requires `call_later`, which is Step 3), so we
-//! instead use explicit `Task.cancel()` and `await asyncio.sleep(0)` to yield
-//! control back to the event loop.
+//! The cancellation tests use explicit `Task.cancel()` and
+//! `await asyncio.sleep(0)` to yield control back to the event loop.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::future::Future;
@@ -275,13 +273,13 @@ print(f"SLEPT:{result['slept_ms']}")
 }
 
 // =============================================================================
-// Step 2 — Shutdown drain tests
+// Shutdown drain tests
 // =============================================================================
 
 /// Fire-and-forget: main returns immediately while a slow background task is
 /// still awaiting a host callback. The drain logic in `_poll` must cancel the
-/// straggler (triggering the Step 1 `_await_waitable` cleanup path) and drop
-/// the waitable set cleanly. Before Step 2, this would trap on
+/// straggler (triggering the `_await_waitable` cancellation cleanup path) and
+/// drop the waitable set cleanly. Without the drain logic, this would trap on
 /// `waitable_set.drop` because the set still contained the live subtask.
 #[tokio::test]
 async fn test_fire_and_forget_straggler_drained_on_shutdown() {

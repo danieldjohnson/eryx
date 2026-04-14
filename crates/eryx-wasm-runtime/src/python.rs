@@ -1185,7 +1185,7 @@ def _poll(state: _AsyncState) -> int:
             for t in stragglers:
                 t.cancel()
             # Run cancellation handlers. Stragglers awaiting host waitables
-            # will take the _await_waitable exception path (Step 1), which
+            # will take the _await_waitable exception path, which
             # does sync subtask_cancel_ -> subtask_drop_ to release their
             # host subtasks.
             _loop.poll(state)

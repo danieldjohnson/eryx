@@ -1,11 +1,11 @@
-//! Integration tests for the timer (Step 3): `call_at`, `call_later`, and
+//! Integration tests for the timer: `call_at`, `call_later`, and
 //! `asyncio.sleep()`.
 //!
 //! These tests verify that:
 //! - `asyncio.sleep()` works and doesn't block other coroutines
 //! - `call_later` / `call_at` schedule callbacks correctly
-//! - Timer cancellation releases the host subtask (via Step 1)
-//! - Pending timers at shutdown are drained cleanly (via Step 2)
+//! - Timer cancellation releases the host subtask
+//! - Pending timers at shutdown are drained cleanly
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::future::Future;
@@ -258,7 +258,7 @@ except asyncio.TimeoutError:
     );
 }
 
-/// Timer cancelled on main exit (exercises Step 2 drain):
+/// Timer cancelled on main exit (exercises shutdown drain):
 /// `asyncio.create_task(asyncio.sleep(10))` then main returns immediately.
 /// Should shut down promptly, no trap, no 10-second hang.
 #[tokio::test]
