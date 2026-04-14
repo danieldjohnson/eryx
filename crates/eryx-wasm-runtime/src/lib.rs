@@ -1382,6 +1382,53 @@ pub fn do_tls_close(handle: u32) {
     call_tls_close(handle);
 }
 
+// -----------------------------------------------------------------------------
+// Timer operations
+// -----------------------------------------------------------------------------
+
+/// Result of calling the timer sleep import.
+#[derive(Debug)]
+pub enum TimerSleepResult {
+    /// Completed immediately (delay was 0).
+    Ok,
+    /// Pending — need to await the subtask. Contains (subtask_id, 0).
+    Pending(u32, u32),
+}
+
+/// Start a timer sleep for `delay_ns` nanoseconds (CM-async).
+///
+/// Returns `TimerSleepResult::Pending(subtask, 0)` if the sleep is in flight,
+/// or `TimerSleepResult::Ok` if it completed immediately (delay was 0).
+/// The caller should `await _await_waitable(subtask)` on the pending case.
+pub fn do_timer_sleep(delay_ns: u64) -> Result<TimerSleepResult, String> {
+    CURRENT_WIT.with(|cell| {
+        let wit = cell.borrow();
+        let wit = wit
+            .as_ref()
+            .ok_or_else(|| "Timer sleep called outside of execute context".to_string())?;
+
+        let import_func = wit
+            .get_import(Some("eryx:timer/timer@0.1.0"), "sleep")
+            .ok_or_else(|| "timer.sleep import not found".to_string())?;
+
+        let mut cx = Box::new(EryxCall::new());
+        cx.push_u64(delay_ns);
+
+        // CM-async: returns a pending subtask if the sleep is in flight.
+        let pending = unsafe { import_func.call_import_async(&mut *cx) };
+
+        if let Some(pending_call) = pending {
+            // Sleep is in flight — return the subtask ID as a waitable.
+            // No result to lift (sleep returns nothing), so we don't need
+            // to store PendingImportState.
+            Ok(TimerSleepResult::Pending(pending_call.subtask, 0))
+        } else {
+            // Completed immediately (delay was 0 or very small).
+            Ok(TimerSleepResult::Ok)
+        }
+    })
+}
+
 /// Initialize callbacks in Python.
 ///
 /// This is called on every execute to ensure callbacks are always in sync

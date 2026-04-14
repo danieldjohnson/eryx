@@ -12,6 +12,9 @@ world sandbox {
     /// TLS networking for secure encrypted connections.
     import eryx:net/tls@0.1.0;
 
+    /// Timer/sleep for asyncio.sleep() and call_later/call_at.
+    import eryx:timer/timer@0.1.0;
+
     /// Invoke a callback by name with JSON arguments.
     ///
     /// This is an async function that Python code can await:

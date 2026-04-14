@@ -905,6 +905,26 @@ fn _eryx_tls_close(handle: u32) {
     crate::do_tls_close(handle);
 }
 
+/// Start a timer sleep for a duration in nanoseconds (CM-async).
+/// Returns a tuple: (result_type, value)
+/// - result_type 0: completed immediately (delay was 0)
+/// - result_type 2: pending - value is a tuple (subtask_id, 0)
+///
+/// Python signature: _eryx_timer_sleep(delay_ns: int) -> tuple[int, Any]
+#[pyfunction]
+fn _eryx_timer_sleep(py: Python<'_>, delay_ns: u64) -> PyResult<(i32, Py<PyAny>)> {
+    match crate::do_timer_sleep(delay_ns) {
+        Ok(crate::TimerSleepResult::Ok) => {
+            Ok((0, py.None().into_pyobject(py)?.into_any().unbind()))
+        }
+        Ok(crate::TimerSleepResult::Pending(subtask, promise)) => {
+            let tuple = (subtask, promise);
+            Ok((2, tuple.into_pyobject(py)?.into_any().unbind()))
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 /// The _eryx module definition.
 /// This generates a `PyInit__eryx` function that can be registered with Python.
 #[pymodule]
@@ -933,6 +953,8 @@ fn eryx_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_eryx_tls_read, m)?)?;
     m.add_function(wrap_pyfunction!(_eryx_tls_write, m)?)?;
     m.add_function(wrap_pyfunction!(_eryx_tls_close, m)?)?;
+    // Timer functions
+    m.add_function(wrap_pyfunction!(_eryx_timer_sleep, m)?)?;
     Ok(())
 }
 
@@ -973,6 +995,19 @@ import _eryx
 from contextvars import ContextVar, Context
 from dataclasses import dataclass
 from typing import Any, Optional
+
+class _EryxTimerHandle(asyncio.TimerHandle):
+    """TimerHandle subclass that cancels the backing sleep task."""
+    __slots__ = ('_task',)
+
+    def __init__(self, when, callback, args, loop, context):
+        super().__init__(when, callback, args, loop, context)
+        self._task = None
+
+    def cancel(self):
+        super().cancel()
+        if self._task is not None:
+            self._task.cancel()
 
 # Callback codes (returned from run_async/resume)
 EXIT = 0   # Execution complete
@@ -1050,6 +1085,37 @@ class _EryxLoop(asyncio.AbstractEventLoop):
 
     def get_task_factory(self):
         return None
+
+    def call_at(self, when, callback, *args, context=None):
+        if context is None:
+            context = contextvars.copy_context()
+        handle = _EryxTimerHandle(when, callback, args, self, context)
+
+        async def _run_timer():
+            delay = max(0.0, when - self.time())
+            delay_ns = int(delay * 1e9)
+            if delay_ns > 0:
+                result_type, value = _eryx._eryx_timer_sleep(delay_ns)
+                if result_type == 2:  # Pending — await the subtask
+                    waitable, _promise = value
+                    await _await_waitable(waitable)
+            if not handle._cancelled:
+                handle._run()
+
+        # The timer task needs its own context copy — the caller's context
+        # may already be entered (e.g. call_at invoked from inside a task
+        # step), and Python forbids re-entering the same Context.
+        task_context = context.copy()
+        handle._task = self.create_task(_run_timer(), context=task_context)
+        return handle
+
+    def call_later(self, delay, callback, *args, context=None):
+        if delay <= 0:
+            return self.call_soon(callback, *args, context=context)
+        return self.call_at(self.time() + delay, callback, *args, context=context)
+
+    def _timer_handle_cancelled(self, handle):
+        pass  # No scheduled-heap bookkeeping needed — timers are task-based.
 
     # Stub methods required by AbstractEventLoop
     def time(self): return time.monotonic()

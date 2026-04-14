@@ -146,6 +146,7 @@ pub enum NetRequest {
         /// TLS connection handle to close.
         handle: u32,
     },
+
 }
 
 /// Callback info for introspection (internal type to avoid conflicts with generated code).
@@ -381,6 +382,8 @@ wasmtime::component::bindgen!({
         "eryx:net/tls.read": async,
         "eryx:net/tls.write": async,
         "eryx:net/tls.close": async,
+        // Note: timer.sleep is `async func` in WIT so it's automatically CM-async —
+        // no entry needed here (this list is only for fiber-based async on sync funcs).
     },
 });
 
@@ -538,6 +541,7 @@ impl SandboxImports for ExecutorState {
 // Import the WIT-generated network module types
 use self::eryx::net::tcp;
 use self::eryx::net::tls;
+use self::eryx::timer::timer;
 
 // Convert our TcpError to the WIT-generated TcpError type.
 fn to_wit_tcp_error(e: crate::net::TcpError) -> tcp::TcpError {
@@ -764,6 +768,27 @@ impl tls::Host for ExecutorState {
         if let Some(ref tx) = self.net_tx {
             // Fire-and-forget for close
             let _ = tx.send(NetRequest::TlsClose { handle }).await;
+        }
+    }
+}
+
+// ============================================================================
+// Timer Host Implementation (fiber-based async)
+// ============================================================================
+
+impl timer::Host for ExecutorState {}
+
+impl timer::HostWithStore for HasSelf<ExecutorState> {
+    fn sleep<T>(
+        _accessor: &wasmtime::component::Accessor<T, Self>,
+        delay_ns: u64,
+    ) -> impl ::core::future::Future<Output = ()> + Send {
+        tracing::trace!(delay_ns, "Timer sleep requested");
+        async move {
+            if delay_ns == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_nanos(delay_ns)).await;
         }
     }
 }

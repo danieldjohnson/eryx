@@ -517,6 +517,9 @@ fn add_sandbox_stubs(linker: &mut Linker<PreInitCtx>) -> Result<()> {
     // Add network stubs (TCP and TLS interfaces)
     add_network_stubs(linker)?;
 
+    // Add timer stubs
+    add_timer_stubs(linker)?;
+
     Ok(())
 }
 
@@ -567,6 +570,28 @@ enum PreInitTlsError {
 ///
 /// Note: The WIT declares these as sync `func` but we use fiber-based async on the host
 /// (`func_wrap_async`), which appears blocking to the guest but allows async I/O on the host.
+fn add_timer_stubs(linker: &mut Linker<PreInitCtx>) -> Result<()> {
+    use wasmtime::component::Accessor;
+
+    let mut timer_instance = linker
+        .instance("eryx:timer/timer@0.1.0")
+        .context("Failed to get eryx:timer/timer instance")?;
+
+    // sleep: async func(delay-ns: u64)
+    // CM-async — uses func_wrap_concurrent like invoke.
+    timer_instance.func_wrap_concurrent(
+        "sleep",
+        |_accessor: &Accessor<PreInitCtx>, (_delay_ns,): (u64,)| {
+            Box::pin(async move {
+                // No-op during pre-init — timer not available.
+                Ok(())
+            })
+        },
+    )?;
+
+    Ok(())
+}
+
 fn add_network_stubs(linker: &mut Linker<PreInitCtx>) -> Result<()> {
     // Get or create the eryx:net/tcp interface
     let mut tcp_instance = linker

@@ -1,0 +1,25 @@
+/// Timer interface for the eryx sandbox.
+///
+/// Provides sleep/timer functionality for Python code running in the sandbox.
+/// Used by the asyncio event loop's `call_later` / `call_at` methods and
+/// `asyncio.sleep()`.
+///
+/// ## Design Notes
+///
+/// `delay-ns` is a relative duration in nanoseconds. The guest computes
+/// `max(0, deadline - now)` before calling, so the host just needs to sleep
+/// for the given duration. This avoids clock-epoch conversion issues between
+/// the guest's WASI monotonic clock and the host's tokio Instant.
+///
+/// Declared as `async func` so the Component Model creates a subtask that
+/// integrates with the guest's waitable-set / event-loop machinery. This
+/// allows the sleep to suspend only the awaiting coroutine while other
+/// asyncio tasks continue running — unlike fiber-based async which blocks
+/// the entire event loop.
+package eryx:timer@0.1.0;
+
+interface timer {
+    /// Sleep for the given duration in nanoseconds.
+    /// If delay-ns is 0, completes immediately.
+    sleep: async func(delay-ns: u64);
+}
