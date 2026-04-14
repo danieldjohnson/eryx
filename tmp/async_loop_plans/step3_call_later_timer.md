@@ -9,126 +9,106 @@ scheduled callback pattern all fail inside the sandbox.
 
 Adding real timer support requires some kind of clock-aware wake primitive.
 The cleanest approach that needs no wasmtime/CM-ABI changes is to add one
-host-async function — `sleep-until` — that the guest calls like any other
-async host import. Each `call_later` becomes a Python Task that awaits
-`sleep-until` and then invokes the callback. Cancellation propagates through
-the fix from Step 1, and shutdown cleans up via Step 2.
+host-async function — `sleep` — that the guest calls like any other async
+host import. Each `call_later` becomes a Python Task that awaits `sleep` and
+then invokes the callback. Cancellation propagates through the fix from
+Step 1, and shutdown cleans up via Step 2.
 
 This is the "Option A" design: simpler than a Python-side timer heap
 ("Option B"), adequate for typical async workloads, and forward-compatible —
-Option B would use the same `sleep-until` WIT import if later desired.
+Option B would use the same `sleep` WIT import if later desired.
 
-## What to change
+## What changed (final implementation)
 
 ### 1. WIT interface
 
-Add a new interface at `crates/eryx-runtime/wit/` (new file, e.g.
-`deps/timer/timer.wit` following the `net.wit` pattern):
+New file `crates/eryx-runtime/wit/deps/timer.wit` (hardlinked into
+`crates/eryx/wit/deps/timer.wit`):
 
 ```wit
 package eryx:timer@0.1.0;
 
 interface timer {
-    /// Sleep until the given WASI monotonic-clock instant (nanoseconds).
-    /// If the deadline is already past, completes immediately.
-    sleep-until: async func(deadline-ns: u64);
+    /// Sleep for the given duration in nanoseconds.
+    /// If delay-ns is 0, completes immediately.
+    sleep: async func(delay-ns: u64);
 }
 ```
 
-Import it in the sandbox world (runtime.wit:8):
+Imported in `runtime.wit`:
 
 ```wit
-world sandbox {
-    import eryx:net/tcp@0.1.0;
-    import eryx:net/tls@0.1.0;
-    import eryx:timer/timer@0.1.0;
-    ...
-}
+import eryx:timer/timer@0.1.0;
 ```
 
-**Clock rationale.** `deadline-ns` is measured in WASI
-`monotonic-clock.now()` units — the same units backing CPython's
-`time.monotonic()` on WASI. Wasmtime implements the WASI monotonic clock by
-storing an `Instant` at store creation and returning
-`initial.elapsed().as_nanos()`; the host's `tokio::time::Instant` is backed
-by the same OS monotonic clock, differing only in epoch. The host impl of
-`sleep-until` thus converts the WASI instant to a tokio `Instant` via the
-store's `initial` (one extra clock read) and calls
-`tokio::time::sleep_until`. Absolute deadlines don't drift if there's
-latency between the guest issuing the call and the host starting the sleep,
-and match how CPython's `BaseEventLoop` internally schedules (`_scheduled`
-holds absolute times).
+**Design decisions:**
 
-Note: WASI `monotonic-clock` also offers `subscribe-instant` returning a
-`pollable`. We cannot reuse this — pollables are WASI's wait primitive,
-whereas the sandbox's WAIT/resume machinery uses Component Model waitable
-sets of CM subtasks. We need a CM-async import to get a waitable compatible
-with the existing `_await_waitable` helper.
+- **`delay-ns` (relative) instead of `deadline-ns` (absolute).** The
+  original plan used absolute WASI monotonic-clock timestamps, but the host
+  can't easily convert those back to a tokio sleep — `WasiCtx` doesn't
+  expose the `Instant` epoch it captured at creation. Relative delays avoid
+  the clock-epoch problem entirely, with negligible drift in a single-guest
+  sandbox.
 
-### 2. Host (eryx crate) implementation
+- **`async func` (CM-async) instead of sync `func` + fiber-based async.**
+  TCP/TLS use fiber-based async (sync WIT + `func_wrap_async` in bindgen),
+  which blocks the entire fiber. For timers that's fatal — `asyncio.sleep(1)`
+  would freeze the entire event loop for 1 second. CM-async produces a
+  subtask that integrates with the `_await_waitable` machinery, suspending
+  only the awaiting coroutine while other tasks continue running.
+
+### 2. Host implementation (`crates/eryx/src/wasm.rs`)
 
 ```rust
-async fn sleep_until(deadline_ns: u64) {
-    let now_ns = wasi_monotonic_now_ns(); // same function WASI uses
-    if deadline_ns <= now_ns {
-        return; // past deadline; complete immediately
+impl timer::Host for ExecutorState {}
+
+impl timer::HostWithStore for HasSelf<ExecutorState> {
+    fn sleep<T>(
+        _accessor: &Accessor<T, Self>,
+        delay_ns: u64,
+    ) -> impl Future<Output = ()> + Send {
+        async move {
+            if delay_ns == 0 { return; }
+            tokio::time::sleep(Duration::from_nanos(delay_ns)).await;
+        }
     }
-    let delay = Duration::from_nanos(deadline_ns - now_ns);
-    tokio::time::sleep(delay).await;
 }
 ```
 
-`wasi_monotonic_now_ns()` should use the same source wasmtime uses for
-WASI monotonic-clock — the store's `initial: Instant` captured at creation,
-returning `initial.elapsed().as_nanos() as u64`. Depending on how the
-sandbox store is structured, this may mean reading `initial` from the store
-context, or re-reading it via the WASI clock table. Verify that the value
-matches what `time.monotonic()` would see from inside the guest for the
-same moment; a one-off assertion test ("sleep 0 ns when deadline == guest's
-now") catches any epoch mismatch.
+Uses the CM-async trait pattern (like `invoke`), not the fiber-based TCP
+pattern. The sleep runs directly on tokio — no `NetRequest` channel needed
+since there's no state to manage.
 
-The host-side wiring mirrors the TCP path — look at how `eryx:net/tcp` is
-hooked up in `crates/eryx/src/wasm.rs` (sandbox builder + async host-fn
-registration) and mirror it for timer.
+### 3. Preinit stub (`crates/eryx-runtime/src/preinit.rs`)
 
-### 3. Guest (eryx-wasm-runtime) plumbing
+```rust
+timer_instance.func_wrap_concurrent(
+    "sleep",
+    |_accessor: &Accessor<PreInitCtx>, (_delay_ns,): (u64,)| {
+        Box::pin(async move { Ok(()) })
+    },
+)?;
+```
 
-In `crates/eryx-wasm-runtime/src/lib.rs`, add:
+Uses `func_wrap_concurrent` (like `invoke`), not `func_wrap_async` (TCP).
 
-- `call_timer_sleep_until(deadline_ns: u64) -> Result<NetResult<()>, String>`
-  following the template at `lib.rs:865` (TCP connect).
-- `do_timer_sleep_until(deadline_ns: u64) -> Result<(i32, NetResultValue), String>`
-  following the `do_tcp_connect` template at `lib.rs:1234`.
+### 4. Guest Rust plumbing (`crates/eryx-wasm-runtime/src/lib.rs`)
 
-In `crates/eryx-wasm-runtime/src/python.rs`:
+```rust
+pub enum TimerSleepResult { Ok, Pending(u32, u32) }
 
-- Add the PyO3 wrapper `_eryx_timer_sleep_until`, register it in `eryx_module`
-  around python.rs:904.
-- Inside `ERYX_ASYNC_INJECT_CODE`, add:
+pub fn do_timer_sleep(delay_ns: u64) -> Result<TimerSleepResult, String> {
+    // Uses call_import_async (CM-async), not call_import_sync (fiber).
+    // Returns Pending(subtask_id, 0) if the sleep is in flight.
+    // No PendingImportState needed — sleep has no return value to lift.
+}
+```
 
-  ```python
-  async def await_sleep_until(deadline_ns: int) -> None:
-      result_type, value = _eryx._eryx_timer_sleep_until(deadline_ns)
-      if result_type == 0:
-          return                       # past deadline; completed immediately
-      elif result_type == 1:
-          raise RuntimeError(value)    # shouldn't happen in practice
-      else:
-          waitable, _promise = value
-          await _await_waitable(waitable)
-  ```
+PyO3 wrapper `_eryx_timer_sleep(delay_ns)` returns `(status, value)`:
+- status 0: completed immediately
+- status 2: pending — value is `(subtask_id, 0)`
 
-  (`_await_waitable` is the helper from Step 1.)
-
-### 4. `_EryxLoop.call_at` / `call_later`
-
-`_EryxLoop.time()` stays as its default `time.monotonic()` (already defined
-at python.rs:1041). `time.monotonic()` returns float seconds; the WASI
-instant in nanoseconds is `int(t * 1e9)`. The two agree because
-`time.monotonic()` on WASI is backed by `monotonic-clock.now()` divided by
-1e9.
-
-Implement the scheduling methods:
+### 5. `_EryxLoop.call_at` / `call_later` / `_timer_handle_cancelled`
 
 ```python
 def call_at(self, when, callback, *args, context=None):
@@ -137,140 +117,148 @@ def call_at(self, when, callback, *args, context=None):
     handle = asyncio.TimerHandle(when, callback, args, self, context)
 
     async def _run_timer():
-        deadline_ns = int(when * 1e9)
-        await await_sleep_until(deadline_ns)
+        delay = max(0.0, when - self.time())
+        delay_ns = int(delay * 1e9)
+        if delay_ns > 0:
+            result_type, value = _eryx._eryx_timer_sleep(delay_ns)
+            if result_type == 2:  # Pending
+                waitable, _promise = value
+                await _await_waitable(waitable)
         if not handle._cancelled:
             handle._run()
+        _async_state.get().timer_tasks.pop(handle, None)
 
-    task = asyncio.Task(_run_timer(), loop=self, context=context)
-    # Hook handle.cancel() to also cancel the task so the sleep subtask drops.
-    original_cancel = handle.cancel
-    def cancel():
-        original_cancel()
-        task.cancel()
-    handle.cancel = cancel
+    task_context = context.copy()
+    task = self.create_task(_run_timer(), context=task_context)
+    task_context[_async_state].timer_tasks[handle] = task
     return handle
 
 def call_later(self, delay, callback, *args, context=None):
     if delay <= 0:
         return self.call_soon(callback, *args, context=context)
     return self.call_at(self.time() + delay, callback, *args, context=context)
+
+def _timer_handle_cancelled(self, handle):
+    state = handle._context[_async_state]
+    task = state.timer_tasks.pop(handle, None)
+    if task is not None:
+        task.cancel()
 ```
 
-Fast path: `call_later(0, ...)` skips the sleep roundtrip entirely. Past
-deadlines passed to `call_at` will short-circuit on the host side (the
-`sleep-until` impl returns immediately if `deadline_ns <= now_ns`).
+**Key design decisions:**
 
-### 5. Remove `call_at` / `call_later` / `time` from the stub list
+- **`_AsyncState.timer_tasks: dict`** maps `TimerHandle → Task`. This keeps
+  all async plumbing in one place. When a handle is cancelled, the loop's
+  `_timer_handle_cancelled` callback (asyncio's official extension point)
+  looks up and cancels the backing task.
 
-Currently `_EryxLoop` implicitly raises `NotImplementedError` for these. Make
-sure the new implementations replace any stubs and that nothing in the class
-still raises.
+- **No `TimerHandle` subclass.** Earlier approach subclassed `TimerHandle`
+  to add a `_task` slot, but `TimerHandle` uses `__slots__` which made
+  monkey-patching impossible. The map approach avoids this entirely —
+  stock `TimerHandle`, cancellation via the official callback.
 
-## Files to touch
+- **`context.copy()` for timer tasks.** The caller's context may already
+  be entered (call_at invoked from inside a task step). Python forbids
+  re-entering the same Context, so the timer task gets its own copy. Both
+  contexts share the same `_async_state` since Context.copy() is shallow.
 
-- `crates/eryx-runtime/wit/runtime.wit` — import the new interface.
-- `crates/eryx-runtime/wit/deps/timer/timer.wit` — new file with the interface
-  definition.
-- `crates/eryx/src/wasm.rs` (and possibly `sandbox.rs`) — register the host
-  implementation following the TCP pattern.
-- `crates/eryx-wasm-runtime/src/lib.rs` — guest-side import calls.
+- **`call_later(0, ...)` fast path.** Delegates to `call_soon`, skipping
+  the host sleep roundtrip. Matches CPython's `asyncio.sleep(0)` semantics
+  (yield once, no real timer).
+
+## Files touched
+
+- `crates/eryx-runtime/wit/deps/timer.wit` — **new file**, hardlinked into
+  `crates/eryx/wit/deps/timer.wit`.
+- `crates/eryx-runtime/wit/runtime.wit` / `crates/eryx/wit/runtime.wit` —
+  added `import eryx:timer/timer@0.1.0`.
+- `crates/eryx/src/wasm.rs` — `timer::Host` + `timer::HostWithStore` impls,
+  `use` import, comment in `bindgen!` (not listed in async imports since
+  CM-async is automatic).
+- `crates/eryx-runtime/src/preinit.rs` — `add_timer_stubs` function +
+  call site.
+- `crates/eryx-wasm-runtime/src/lib.rs` — `TimerSleepResult` enum,
+  `do_timer_sleep` (CM-async via `call_import_async`).
 - `crates/eryx-wasm-runtime/src/python.rs`:
-  - `eryx_module` at line ~904 — register PyO3 wrappers.
-  - `ERYX_ASYNC_INJECT_CODE` — add `await_sleep_until`, update `_EryxLoop` with
-    `time()`, `call_at()`, `call_later()`.
+  - PyO3 wrapper `_eryx_timer_sleep`, registered in `eryx_module`.
+  - `_AsyncState`: added `timer_tasks: dict` field.
+  - `_EryxLoop`: added `call_at`, `call_later`, `_timer_handle_cancelled`.
+- `crates/eryx/tests/timer.rs` — **new file**, 6 integration tests.
 
-## How to test
+## Tests
 
-Place tests in `crates/eryx/tests/` and an example in `crates/eryx/examples/`
-(something like `timers.rs`).
+Tests are in `crates/eryx/tests/timer.rs`. Run with:
+```bash
+cargo test --test timer --features embedded
+```
 
-1. **Bare sleep**: `await asyncio.sleep(0.05)`. Assert it blocked for ~50ms on
-   the wall clock (with generous tolerance). Primary smoke test.
+1. **`test_asyncio_sleep_basic`** — `await asyncio.sleep(0.05)` blocks for
+   ~50ms wall clock.
 
-2. **Zero delay**: `await asyncio.sleep(0)` — should not round-trip through the
-   host. Easy to check by ensuring `_eryx_timer_sleep_until` isn't called
-   (instrument or rely on fast path).
+2. **`test_asyncio_sleep_zero`** — `await asyncio.sleep(0)` completes
+   immediately via `call_later(0, ...)` → `call_soon` fast path.
 
-3. **Past deadline**: `loop.call_at(loop.time() - 1, cb)` — `cb` fires on the
-   next poll iteration.
+3. **`test_concurrent_sleeps_with_gather`** — three 50ms sleeps via
+   `asyncio.gather` complete in ~50ms total (parallel, not sequential).
+   Confirms CM-async suspends per-coroutine.
 
-4. **`asyncio.wait_for` timeout**: `wait_for(slow_callback(), timeout=0.01)`
-   raises `TimeoutError`. Combined with Step 1, no subtask leak.
+4. **`test_wait_for_timeout`** — `asyncio.wait_for(slow_callback(),
+   timeout=0.05)` raises `TimeoutError`. Exercises `call_at` +
+   `_timer_handle_cancelled` + Step 1 subtask cleanup.
 
-5. **Nested timers**: `call_later(0.01, lambda: loop.call_later(0.01, done))` —
-   both fire, final callback runs.
+5. **`test_timer_drained_on_shutdown`** — `asyncio.create_task(
+   asyncio.sleep(10))` then main returns. Sandbox shuts down promptly
+   (no 10s hang), no trap. Exercises Step 2 drain.
 
-6. **Many concurrent timers**: 100 `asyncio.sleep`s in a `gather`. All
-   complete within reasonable wall-clock bounds. Not a benchmark — just sanity.
-
-7. **Clock coherence**: `asyncio.sleep(0.1)` actually takes ~100ms, not 10ms or
-   1s. This fails loudly if `time()` and `sleep-until` disagree on units or
-   epoch.
-
-8. **Timer cancelled on main exit** (exercises Step 2):
-   ```python
-   asyncio.create_task(asyncio.sleep(10))
-   # main returns
-   ```
-   Sandbox shuts down promptly, no trap, no 10-second hang.
-
-9. **TimerHandle.cancel() before firing**: schedule with `call_later`, cancel
-   immediately, advance time past the deadline — callback does not fire, no
-   leaked subtask.
-
-Run via `mise run test`.
+6. **`test_sleep_with_callback`** — `asyncio.sleep` followed by a host
+   callback in the same execution. Confirms timer and callback subtasks
+   coexist.
 
 ## Things to verify
 
-- **Clock source agreement.** The host impl of `sleep-until` must use the
-  same monotonic-clock epoch as WASI's `monotonic-clock.now()` (i.e., the
-  store's `initial: Instant`). If the host reads a different `Instant`
-  start, deadlines will drift by the offset between the two. Add a direct
-  assertion test: from the guest, call `sleep-until(time.monotonic_ns())`
-  and confirm it returns immediately (past deadline path) — if it instead
-  blocks, the epochs disagree. Also: `asyncio.sleep(0.1)` should block
-  ~100ms wall-clock.
-
-- **Cache/build dance.** Per `AGENTS.md:117-124`, adding a WIT interface
-  invalidates the late-linking artifact cache. After the WIT edit, reviewers
-  (and CI) need a fresh build:
-  ```
-  mise run clean-late-linking-cache
-  mise run setup
-  ```
-  Call this out explicitly in the PR description so reviewers don't hit
-  phantom `type-checking export func` errors. Consider also documenting in
-  `AGENTS.md` under "Symptoms of Stale Caches."
+- **Cache/build dance.** Adding a WIT interface invalidates the late-linking
+  artifact cache. After the WIT edit, a fresh container build is needed
+  (see `container/README.md`).
 
 - **Preinit snapshot.** `crates/eryx-runtime/runtime.cwasm` is committed and
   embedded via `include_bytes!`. It must be rebuilt against the new WIT and
   re-committed — otherwise CI will have a stale snapshot.
 
-- **`_eryx_reserved` name collisions.** python.rs:3208 lists reserved names
-  injected into user globals. If the feature exposes anything at the
-  user-globals level (probably not — `call_later` is on `loop`, not globals),
-  add it here.
-
-- **`asyncio.sleep(0)` behaviour matches CPython.** CPython treats it as
-  "yield to the loop once" rather than a real timer. Confirm our fast path
-  does the same.
-
-- **`TimerHandle` interface compatibility.** CPython returns
-  `asyncio.TimerHandle` with `when()`, `cancel()`, `cancelled()`. Use
-  `asyncio.TimerHandle` directly rather than rolling our own, so user code
-  that introspects the return value just works.
+- **`asyncio.sleep(0)` behaviour matches CPython.** `call_later(0, ...)`
+  delegates to `call_soon`, which matches CPython's "yield once" semantics.
+  Verified by `test_asyncio_sleep_zero`.
 
 ## Explicitly NOT in scope
 
-- Don't touch `_AsyncState` / ContextVar plumbing.
 - Don't implement other `AbstractEventLoop` stubs (`add_reader`,
   `run_in_executor`, etc.).
 - Don't migrate to "Option B" (Python-side timer heap with rearmable single
   timer waitable). The WIT interface is forward-compatible — Option B would
-  reuse `sleep-until` with a different guest-side scheduler — so nothing here
+  reuse `sleep` with a different guest-side scheduler — so nothing here
   paints us into a corner.
-- Don't alter snapshot/restore behaviour for pending timers. Briefly audit
-  `snapshot-state` to confirm it doesn't try to pickle loop state that now
-  includes timer handles; if it does, timers should simply not survive
-  snapshots (document and move on).
+- Don't alter snapshot/restore behaviour for pending timers.
+
+## Alternatives considered
+
+- **Absolute deadline (`deadline-ns`) instead of relative delay.** The
+  original plan used absolute WASI monotonic-clock timestamps. This avoids
+  drift from processing latency, but requires converting guest timestamps
+  back to host Instants. `WasiCtx` doesn't expose its epoch Instant, and
+  storing a separate Instant at creation introduces two clocks that may
+  diverge. Relative delays are simpler and sufficient for sandbox workloads.
+
+- **Fiber-based async (sync WIT + `func_wrap_async`).** This is how TCP/TLS
+  work. But fiber-based async blocks the entire event loop, which defeats
+  the purpose of `asyncio.sleep()`. CM-async suspends only the awaiting
+  coroutine.
+
+- **`_EryxTimerHandle` subclass.** Earlier approach added a `_task` slot to
+  a `TimerHandle` subclass and overrode `cancel()`. This works but
+  `TimerHandle.__slots__` makes it awkward, and the map-based approach is
+  cleaner — it uses the official `_timer_handle_cancelled` extension point
+  and keeps all plumbing in `_AsyncState`.
+
+- **Net handler channel for timer.** The original plan routed timer requests
+  through the `NetRequest` channel like TCP. But timers have no state to
+  manage — just a `tokio::time::sleep`. The host impl does the sleep
+  directly in `timer::HostWithStore`, avoiding unnecessary channel plumbing.

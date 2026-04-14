@@ -996,19 +996,6 @@ from contextvars import ContextVar, Context
 from dataclasses import dataclass
 from typing import Any, Optional
 
-class _EryxTimerHandle(asyncio.TimerHandle):
-    """TimerHandle subclass that cancels the backing sleep task."""
-    __slots__ = ('_task',)
-
-    def __init__(self, when, callback, args, loop, context):
-        super().__init__(when, callback, args, loop, context)
-        self._task = None
-
-    def cancel(self):
-        super().cancel()
-        if self._task is not None:
-            self._task.cancel()
-
 # Callback codes (returned from run_async/resume)
 EXIT = 0   # Execution complete
 WAIT = 2   # Execution pending, need to wait
@@ -1028,6 +1015,7 @@ class _AsyncState:
     handles: list[asyncio.Handle]
     pending_count: int
     tasks: set
+    timer_tasks: dict  # TimerHandle → Task backing the sleep
 
 
 class _EryxLoop(asyncio.AbstractEventLoop):
@@ -1089,7 +1077,7 @@ class _EryxLoop(asyncio.AbstractEventLoop):
     def call_at(self, when, callback, *args, context=None):
         if context is None:
             context = contextvars.copy_context()
-        handle = _EryxTimerHandle(when, callback, args, self, context)
+        handle = asyncio.TimerHandle(when, callback, args, self, context)
 
         async def _run_timer():
             delay = max(0.0, when - self.time())
@@ -1101,12 +1089,17 @@ class _EryxLoop(asyncio.AbstractEventLoop):
                     await _await_waitable(waitable)
             if not handle._cancelled:
                 handle._run()
+            # Clean up the mapping once the timer task completes.
+            state = _async_state.get()
+            state.timer_tasks.pop(handle, None)
 
         # The timer task needs its own context copy — the caller's context
         # may already be entered (e.g. call_at invoked from inside a task
         # step), and Python forbids re-entering the same Context.
         task_context = context.copy()
-        handle._task = self.create_task(_run_timer(), context=task_context)
+        task = self.create_task(_run_timer(), context=task_context)
+        # Store handle → task so _timer_handle_cancelled can cancel the task.
+        task_context[_async_state].timer_tasks[handle] = task
         return handle
 
     def call_later(self, delay, callback, *args, context=None):
@@ -1115,7 +1108,11 @@ class _EryxLoop(asyncio.AbstractEventLoop):
         return self.call_at(self.time() + delay, callback, *args, context=context)
 
     def _timer_handle_cancelled(self, handle):
-        pass  # No scheduled-heap bookkeeping needed — timers are task-based.
+        # Cancel the backing sleep task so the host subtask is released.
+        state = handle._context[_async_state]
+        task = state.timer_tasks.pop(handle, None)
+        if task is not None:
+            task.cancel()
 
     # Stub methods required by AbstractEventLoop
     def time(self): return time.monotonic()
@@ -1155,7 +1152,7 @@ async def _return_result(coroutine: Any) -> None:
 def run_async(coro) -> int:
     """Run a coroutine, return callback code (EXIT or WAIT|waitable_set<<4)."""
     ctx = Context()
-    state = _AsyncState(None, {}, [], 1, set())
+    state = _AsyncState(None, {}, [], 1, set(), {})
     ctx.run(_set_async_state, state)
     asyncio.create_task(_return_result(coro), context=ctx)
     return _poll(state)
