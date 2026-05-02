@@ -1167,7 +1167,10 @@ def resume(event0: int, event1: int, event2: int) -> int:
     if event0 == _EVENT_SUBTASK and event2 == _STATUS_RETURNED:
         _eryx.waitable_join_(event1, 0)
         _eryx.subtask_drop_(event1)
-        state.futures.pop(event1).set_result(event2)
+        future = state.futures.pop(event1)
+        # Ignore results we receive from cancelled futures
+        if not future.cancelled():
+            future.set_result(event2)
     elif event0 == _EVENT_NONE:
         pass  # Just poll again
     # Other events (streams, futures) would go here if we supported them
