@@ -133,6 +133,8 @@ pub async fn pre_initialize(
 
     let mut wasi_builder = WasiCtxBuilder::new();
     wasi_builder
+        .inherit_stdout()
+        .inherit_stderr()
         .env("PYTHONHOME", "/python-stdlib")
         .env("PYTHONPATH", &python_path)
         .env("PYTHONUNBUFFERED", "1");

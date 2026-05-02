@@ -73,8 +73,8 @@ impl EmbeddedStdlib {
 
         // Check if already extracted (quick validation: directory exists with some files)
         if stdlib_path.exists() {
-            // Verify it looks valid (has encodings/ which is required for Python init)
-            if stdlib_path.join("encodings").exists() {
+            // Verify it looks valid (encodings/__init__.py is required for Python init)
+            if stdlib_path.join("encodings").join("__init__.py").is_file() {
                 tracing::debug!(path = %stdlib_path.display(), "Using cached stdlib");
                 return Ok(stdlib_path);
             }
@@ -105,9 +105,13 @@ impl EmbeddedStdlib {
         let extracted_stdlib = temp_extract_dir.path().join("python-stdlib");
 
         // Verify extraction
-        if !extracted_stdlib.join("encodings").exists() {
+        if !extracted_stdlib
+            .join("encodings")
+            .join("__init__.py")
+            .is_file()
+        {
             return Err(Error::Initialization(
-                "Stdlib extraction failed: encodings/ not found".to_string(),
+                "Stdlib extraction failed: encodings/__init__.py not found".to_string(),
             ));
         }
 
@@ -116,7 +120,7 @@ impl EmbeddedStdlib {
             Ok(()) => {
                 // TempDir will clean up the now-empty temp extract dir on drop
             }
-            Err(_) if stdlib_path.join("encodings").exists() => {
+            Err(_) if stdlib_path.join("encodings").join("__init__.py").is_file() => {
                 // Another process won the race - that's fine, TempDir cleans up on drop
                 tracing::debug!("Stdlib extracted by another process");
             }
